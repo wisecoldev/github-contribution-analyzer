@@ -6,4 +6,4 @@ weaknesses / peer-comparison narrative — without ever exposing other
 contributors' identities, commit message text, source code, or file paths.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

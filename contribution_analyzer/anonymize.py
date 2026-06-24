@@ -61,6 +61,64 @@ def build_payload(
     }
 
 
+def build_team_payload(
+    stats: dict[str, ContributorStats],
+    *,
+    identify: bool = False,
+    top: int | None = None,
+    min_commits: int = 1,
+) -> dict:
+    """Build a whole-team, ranked payload for a higher-level codebase analysis.
+
+    Contributors are ranked by commit volume (an *activity* proxy — see the
+    caveat the report always emits). By default every contributor is
+    anonymized to ``Contributor #1``, ``Contributor #2``, …; pass
+    ``identify=True`` to use real display names instead (opt-in, for your own
+    team retrospective).
+
+    Either way the per-contributor payload carries only aggregate counts and
+    ratios — never commit-message text, file paths, or source code.
+    """
+    ranked = sorted(
+        (c for c in stats.values() if c.commits >= min_commits),
+        key=lambda c: (c.commits, c.insertions + c.deletions),
+        reverse=True,
+    )
+    if top:
+        ranked = ranked[:top]
+
+    total_commits = sum(c.commits for c in stats.values())
+    total_lines = sum(c.insertions + c.deletions for c in stats.values())
+
+    contributors = []
+    for idx, c in enumerate(ranked):
+        metrics = c.to_metrics()
+        share = round(c.commits / total_commits, 3) if total_commits else 0.0
+        entry = {
+            "rank": idx + 1,
+            "label": (_display_name(c) if identify else f"Contributor #{idx + 1}"),
+            "commit_share_of_repo": share,
+            **metrics,
+        }
+        contributors.append(entry)
+
+    return {
+        "mode": "team",
+        "identified": bool(identify),
+        "repository_totals": {
+            "total_contributors": len(stats),
+            "contributors_ranked": len(contributors),
+            "total_commits": total_commits,
+            "total_churn_lines": total_lines,
+        },
+        "contributors": contributors,
+    }
+
+
+def _display_name(c: ContributorStats) -> str:
+    return (c.name or c.email or c.key or "Unknown").strip()
+
+
 def _peer_label(index: int) -> str:
     # A, B, ... Z, AA, AB, ...
     letters = string.ascii_uppercase

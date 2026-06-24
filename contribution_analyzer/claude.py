@@ -38,6 +38,56 @@ def generate_report(
     ``payload`` is the output of :func:`anonymize.build_payload` — it contains
     no identities, no code, and no commit-message text.
     """
+    return _request(
+        _SYSTEM_PROMPT,
+        _user_prompt(payload),
+        api_key=api_key,
+        model=model,
+        max_tokens=max_tokens,
+        effort=effort,
+        timeout=timeout,
+    )
+
+
+def generate_team_report(
+    payload: dict,
+    *,
+    identify: bool = False,
+    api_key: str | None = None,
+    model: str = DEFAULT_MODEL,
+    max_tokens: int = 8192,
+    effort: str = "high",
+    timeout: float = 600.0,
+) -> str:
+    """Generate the whole-team, ranked per-contributor analysis.
+
+    ``payload`` is the output of :func:`anonymize.build_team_payload`. It
+    carries only aggregate counts/ratios — never commit text, paths, or code.
+    When ``identify`` is False (the default) the labels are
+    ``Contributor #1``…; when True they are real display names.
+    """
+    return _request(
+        _TEAM_SYSTEM_PROMPT,
+        _team_user_prompt(payload, identify=identify),
+        api_key=api_key,
+        model=model,
+        max_tokens=max_tokens,
+        effort=effort,
+        timeout=timeout,
+    )
+
+
+def _request(
+    system: str,
+    user_content: str,
+    *,
+    api_key: str | None,
+    model: str,
+    max_tokens: int,
+    effort: str,
+    timeout: float,
+) -> str:
+    """POST a single Messages request and return the streamed text."""
     api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ClaudeError(
@@ -51,13 +101,8 @@ def generate_report(
         "stream": True,
         "thinking": {"type": "adaptive"},
         "output_config": {"effort": effort},
-        "system": _SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": _user_prompt(payload),
-            }
-        ],
+        "system": system,
+        "messages": [{"role": "user", "content": user_content}],
     }
 
     data = json.dumps(body).encode("utf-8")
@@ -143,5 +188,59 @@ def _user_prompt(payload: dict) -> str:
         "to the anonymized peers. Do not reveal or speculate about real "
         "identities, and do not reference any confidential or proprietary detail "
         "(there is none in this data).\n\n"
+        "```json\n" + json.dumps(payload, indent=2) + "\n```"
+    )
+
+
+_TEAM_SYSTEM_PROMPT = (
+    "You are an engineering-management analyst writing a higher-level, "
+    "whole-codebase read on a team's git contributions. You are given "
+    "anonymized-or-named, aggregate git METADATA for each contributor on one "
+    "repository — counts and ratios only. You never see source code, commit "
+    "message text, or file paths; the commit-type / topic / path-category "
+    "fields are pre-bucketed COUNTS, not the underlying text.\n\n"
+    "For EACH contributor, ranked as given (the ranking is by commit volume, an "
+    "activity proxy — not a performance ranking), write a profile in EXACTLY "
+    "this shape:\n\n"
+    "## #<rank> — <label>\n"
+    "<commits> commits | <active_months> active months | "
+    "<distinct_tickets_referenced> ticket refs\n"
+    "**Style** — 2-4 sentences inferring how this person works, grounded in the "
+    "metrics (cadence, commit size, the commit-type and topic mix, path "
+    "categories, time-of-day rhythm). Be specific and fair.\n"
+    "**Strengths** — 3-6 bullets, EACH grounded in a specific metric you were "
+    "given (quote the number).\n"
+    "**Weaknesses** — 2-5 bullets, framed constructively, each grounded in a "
+    "metric. Phrase work-pattern observations (e.g. time-of-day spread) as "
+    "neutral signals, never as personal judgements about a person's worth or "
+    "wellbeing.\n"
+    "**Key metric** — one sentence naming the single number that best "
+    "characterises this contributor.\n\n"
+    "Rules:\n"
+    "- NEVER invent data you were not given. If a field is zero or absent, do "
+    "not speculate a value.\n"
+    "- If contributors are anonymized (labels like 'Contributor #1'), do NOT "
+    "guess at real identities.\n"
+    "- Commit counts, churn, ticket counts, and cadence are GAMEABLE PROXIES "
+    "FOR ACTIVITY, not measures of impact, seniority, or code quality. State "
+    "this explicitly in a short closing 'Caveats' section, and avoid implying "
+    "the #1-ranked contributor is the 'best' engineer.\n"
+    "- Be honest, specific, and constructive. Markdown headings. No source "
+    "code, no real ticket IDs, no file paths in your output."
+)
+
+
+def _team_user_prompt(payload: dict, *, identify: bool) -> str:
+    mode = (
+        "Contributors are identified by real display name."
+        if identify
+        else "Contributors are anonymized as 'Contributor #N'; do not attempt to "
+        "de-anonymize them."
+    )
+    return (
+        "Here is the whole-team, ranked contribution metadata for one "
+        f"repository. {mode} Produce one profile per contributor in the exact "
+        "shape described, then a short shared 'Caveats' section. Ground every "
+        "claim in the numbers provided; invent nothing.\n\n"
         "```json\n" + json.dumps(payload, indent=2) + "\n```"
     )

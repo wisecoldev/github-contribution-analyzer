@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contribution-analyzer"
-version = "1.0.0"
-description = "Analyze your git contributions — strengths, weaknesses, and an anonymized comparison to other contributors, optionally narrated by Claude."
+version = "1.1.0"
+description = "Analyze git contributions — per-person or whole-team — strengths, weaknesses, and an anonymized (or opt-in named) comparison, optionally narrated by Claude."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

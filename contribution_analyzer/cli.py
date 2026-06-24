@@ -58,9 +58,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Anthropic API key (else uses ANTHROPIC_API_KEY env var).",
     )
     p.add_argument(
+        "--team",
+        action="store_true",
+        help=(
+            "Higher-level mode: profile and rank EVERY contributor across the "
+            "whole codebase (instead of analyzing one subject)."
+        ),
+    )
+    p.add_argument(
+        "--identify",
+        action="store_true",
+        help=(
+            "Use real contributor display names instead of anonymized "
+            "'Contributor #N' labels (opt-in; default is anonymized). Only "
+            "aggregate counts are ever sent to the API regardless."
+        ),
+    )
+    p.add_argument(
+        "--top",
+        type=int,
+        default=None,
+        metavar="N",
+        help="In --team mode, limit the report to the top N contributors.",
+    )
+    p.add_argument(
+        "--min-commits",
+        type=int,
+        default=1,
+        metavar="N",
+        help="In --team mode, skip contributors with fewer than N commits (default: 1).",
+    )
+    p.add_argument(
         "--dump-payload",
         action="store_true",
-        help="Print the exact anonymized JSON that would be sent to Claude, then exit.",
+        help="Print the exact JSON that would be sent to Claude, then exit.",
     )
     p.add_argument(
         "--version",
@@ -94,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no commits found in this repository.", file=sys.stderr)
         return 2
 
+    # --- Whole-team mode --------------------------------------------------
+    if args.team:
+        return _run_team(stats, args)
+
     # 2. Resolve the subject (the person being analyzed).
     subject = _resolve_subject(stats, args)
     if subject is None:
@@ -120,6 +155,52 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Render and emit the report.
     text = report.render(
+        payload, narrative, repo_path=args.repo, model=model_used
+    )
+    if args.out:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        print(f"Report written to {args.out}", file=sys.stderr)
+    else:
+        print(text)
+    return 0
+
+
+def _run_team(stats, args) -> int:
+    """Whole-codebase mode: profile and rank every contributor."""
+    payload = anonymize.build_team_payload(
+        stats,
+        identify=args.identify,
+        top=args.top,
+        min_commits=args.min_commits,
+    )
+
+    if not payload["contributors"]:
+        print(
+            "error: no contributors met --min-commits; lower the threshold.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.dump_payload:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    narrative = None
+    model_used = None
+    if not args.no_ai:
+        try:
+            narrative = claude.generate_team_report(
+                payload,
+                identify=args.identify,
+                api_key=args.api_key,
+                model=args.model,
+            )
+            model_used = args.model
+        except claude.ClaudeError as exc:
+            print(f"warning: AI narrative skipped: {exc}", file=sys.stderr)
+
+    text = report.render_team(
         payload, narrative, repo_path=args.repo, model=model_used
     )
     if args.out:
