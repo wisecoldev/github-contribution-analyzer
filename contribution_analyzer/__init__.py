@@ -1,9 +1,7 @@
-"""Analyze a person's contributions to a git repository.
+"""Analyze git contributions — per-person or whole-team — from local history.
 
-Gathers anonymized, non-confidential contribution *metadata* from a local git
-repository and (optionally) asks the Claude API to write a strengths /
-weaknesses / peer-comparison narrative — without ever exposing other
-contributors' identities, commit message text, source code, or file paths.
+Aggregate metadata only; optionally narrated by Claude. Never exposes source
+code, commit text, file paths, or (by default) real identities.
 """
 
 __version__ = "1.1.0"

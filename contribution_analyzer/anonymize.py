@@ -1,10 +1,9 @@
-"""Turn raw per-contributor stats into an anonymized, output-safe payload.
+"""Turn raw per-author stats into an output-safe payload.
 
-The subject (the person being analyzed) is labelled ``"You"``. Every other
-contributor is labelled ``"Contributor A"``, ``"Contributor B"``, ... in
-descending order of commit count. Real names and emails are dropped entirely —
-they never appear in the payload that is written to disk or sent to the Claude
-API.
+For single-subject mode the person is "You" and everyone else is "Contributor
+A", "Contributor B", ... ordered by commit count. For team mode every author is
+ranked; labels are "Contributor #1.." unless --identify is on. Names and emails
+are dropped from the anonymized payloads.
 """
 
 from __future__ import annotations
@@ -14,70 +13,44 @@ import string
 from .gitstats import ContributorStats
 
 
-def build_payload(
-    stats: dict[str, ContributorStats],
-    subject: ContributorStats,
-    max_peers: int = 12,
-) -> dict:
-    """Build the anonymized comparison payload.
-
-    Returns a dict with ``subject`` metrics, a list of anonymized ``peers``,
-    and repo-wide ``totals`` for context — no identifying fields anywhere.
-    """
+def build_payload(stats, subject, max_peers=12):
+    """Subject metrics + anonymized peers + repo totals."""
     peers = sorted(
         (c for c in stats.values() if c.key != subject.key),
         key=lambda c: c.commits,
         reverse=True,
     )
 
-    labelled_peers = []
-    for idx, peer in enumerate(peers[:max_peers]):
-        labelled_peers.append(
-            {"label": _peer_label(idx), **peer.to_metrics()}
-        )
+    labelled = [
+        {"label": peer_label(i), **p.to_metrics()}
+        for i, p in enumerate(peers[:max_peers])
+    ]
 
-    total_commits = sum(c.commits for c in stats.values())
-    total_contributors = len(stats)
-
-    subject_metrics = subject.to_metrics()
-    subject_share = (
-        round(subject.commits / total_commits, 3) if total_commits else 0.0
-    )
+    total = sum(c.commits for c in stats.values())
+    share = round(subject.commits / total, 3) if total else 0.0
 
     return {
         "repository_totals": {
-            "total_contributors": total_contributors,
-            "total_commits": total_commits,
-            "peers_shown": len(labelled_peers),
-            "peers_omitted": max(0, len(peers) - len(labelled_peers)),
+            "total_contributors": len(stats),
+            "total_commits": total,
+            "peers_shown": len(labelled),
+            "peers_omitted": max(0, len(peers) - len(labelled)),
         },
         "subject": {
             "label": "You",
-            "commit_share_of_repo": subject_share,
-            "rank_by_commits": _rank(stats, subject),
-            **subject_metrics,
+            "commit_share_of_repo": share,
+            "rank_by_commits": rank_of(stats, subject),
+            **subject.to_metrics(),
         },
-        "peers": labelled_peers,
+        "peers": labelled,
     }
 
 
-def build_team_payload(
-    stats: dict[str, ContributorStats],
-    *,
-    identify: bool = False,
-    top: int | None = None,
-    min_commits: int = 1,
-) -> dict:
-    """Build a whole-team, ranked payload for a higher-level codebase analysis.
+def build_team_payload(stats, *, identify=False, top=None, min_commits=1):
+    """Rank every contributor (by commit volume) into an aggregate payload.
 
-    Contributors are ranked by commit volume (an *activity* proxy — see the
-    caveat the report always emits). By default every contributor is
-    anonymized to ``Contributor #1``, ``Contributor #2``, …; pass
-    ``identify=True`` to use real display names instead (opt-in, for your own
-    team retrospective).
-
-    Either way the per-contributor payload carries only aggregate counts and
-    ratios — never commit-message text, file paths, or source code.
+    Anonymized as "Contributor #N" unless ``identify`` is set, in which case the
+    real display name is used. Either way only counts/ratios are included.
     """
     ranked = sorted(
         (c for c in stats.values() if c.commits >= min_commits),
@@ -91,16 +64,14 @@ def build_team_payload(
     total_lines = sum(c.insertions + c.deletions for c in stats.values())
 
     contributors = []
-    for idx, c in enumerate(ranked):
-        metrics = c.to_metrics()
+    for i, c in enumerate(ranked):
         share = round(c.commits / total_commits, 3) if total_commits else 0.0
-        entry = {
-            "rank": idx + 1,
-            "label": (_display_name(c) if identify else f"Contributor #{idx + 1}"),
+        contributors.append({
+            "rank": i + 1,
+            "label": display_name(c) if identify else f"Contributor #{i + 1}",
             "commit_share_of_repo": share,
-            **metrics,
-        }
-        contributors.append(entry)
+            **c.to_metrics(),
+        })
 
     return {
         "mode": "team",
@@ -115,23 +86,21 @@ def build_team_payload(
     }
 
 
-def _display_name(c: ContributorStats) -> str:
+def display_name(c):
     return (c.name or c.email or c.key or "Unknown").strip()
 
 
-def _peer_label(index: int) -> str:
+def peer_label(index):
     # A, B, ... Z, AA, AB, ...
     letters = string.ascii_uppercase
     if index < len(letters):
         suffix = letters[index]
     else:
-        first = letters[index // len(letters) - 1]
-        second = letters[index % len(letters)]
-        suffix = first + second
+        suffix = letters[index // len(letters) - 1] + letters[index % len(letters)]
     return f"Contributor {suffix}"
 
 
-def _rank(stats: dict[str, ContributorStats], subject: ContributorStats) -> int:
+def rank_of(stats, subject):
     ordered = sorted(stats.values(), key=lambda c: c.commits, reverse=True)
     for i, c in enumerate(ordered, start=1):
         if c.key == subject.key:

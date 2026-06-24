@@ -1,4 +1,4 @@
-"""Command-line interface for the contribution analyzer."""
+"""Command-line entry point."""
 
 from __future__ import annotations
 
@@ -9,112 +9,53 @@ import sys
 from . import __version__, anonymize, claude, gitstats, report
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
     p = argparse.ArgumentParser(
         prog="contribution-analyzer",
-        description=(
-            "Analyze your contributions to a git repository — strengths, "
-            "weaknesses, and an anonymized comparison to other contributors. "
-            "No code, commit text, file paths, or peer identities are exposed."
-        ),
+        description="Analyze git contributions — per-person or whole-team. "
+                    "No code, commit text, file paths, or peer identities are exposed.",
     )
-    p.add_argument(
-        "--repo",
-        default=".",
-        help="Path to the local git repository (default: current directory).",
-    )
-    p.add_argument(
-        "--author",
-        default=None,
-        help=(
-            "Name, email, or fragment identifying the contributor to analyze. "
-            "Defaults to the repo's configured git user (you)."
-        ),
-    )
-    p.add_argument(
-        "--branch",
-        default=None,
-        help="Restrict history to a branch/ref (default: current HEAD history).",
-    )
-    p.add_argument(
-        "--out",
-        "-o",
-        default=None,
-        help="Write the Markdown report to this file (default: stdout).",
-    )
-    p.add_argument(
-        "--no-ai",
-        action="store_true",
-        help="Skip the Claude narrative; emit metrics only (no API key needed).",
-    )
-    p.add_argument(
-        "--model",
-        default=claude.DEFAULT_MODEL,
-        help=f"Claude model id (default: {claude.DEFAULT_MODEL}).",
-    )
-    p.add_argument(
-        "--api-key",
-        default=None,
-        help="Anthropic API key (else uses ANTHROPIC_API_KEY env var).",
-    )
-    p.add_argument(
-        "--team",
-        action="store_true",
-        help=(
-            "Higher-level mode: profile and rank EVERY contributor across the "
-            "whole codebase (instead of analyzing one subject)."
-        ),
-    )
-    p.add_argument(
-        "--identify",
-        action="store_true",
-        help=(
-            "Use real contributor display names instead of anonymized "
-            "'Contributor #N' labels (opt-in; default is anonymized). Only "
-            "aggregate counts are ever sent to the API regardless."
-        ),
-    )
-    p.add_argument(
-        "--top",
-        type=int,
-        default=None,
-        metavar="N",
-        help="In --team mode, limit the report to the top N contributors.",
-    )
-    p.add_argument(
-        "--min-commits",
-        type=int,
-        default=1,
-        metavar="N",
-        help="In --team mode, skip contributors with fewer than N commits (default: 1).",
-    )
-    p.add_argument(
-        "--dump-payload",
-        action="store_true",
-        help="Print the exact JSON that would be sent to Claude, then exit.",
-    )
-    p.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-    )
+    p.add_argument("--repo", default=".",
+                   help="Local git repo (default: current dir).")
+    p.add_argument("--author", default=None,
+                   help="Name/email/fragment to analyze (default: your git config).")
+    p.add_argument("--team", action="store_true",
+                   help="Profile and rank every contributor across the codebase.")
+    p.add_argument("--identify", action="store_true",
+                   help="Use real names instead of 'Contributor #N' (opt-in).")
+    p.add_argument("--top", type=int, default=None, metavar="N",
+                   help="In --team mode, only the top N contributors.")
+    p.add_argument("--min-commits", type=int, default=1, metavar="N",
+                   help="In --team mode, skip authors with fewer than N commits.")
+    p.add_argument("--branch", default=None,
+                   help="Restrict to a branch/ref (default: HEAD history).")
+    p.add_argument("--out", "-o", default=None,
+                   help="Write Markdown here (default: stdout).")
+    p.add_argument("--no-ai", action="store_true",
+                   help="Skip the Claude narrative; metrics only.")
+    p.add_argument("--model", default=claude.DEFAULT_MODEL,
+                   help=f"Claude model id (default: {claude.DEFAULT_MODEL}).")
+    p.add_argument("--api-key", default=None,
+                   help="Anthropic API key (else ANTHROPIC_API_KEY).")
+    p.add_argument("--dump-payload", action="store_true",
+                   help="Print the JSON that would be sent to Claude, then exit.")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None):
     args = build_parser().parse_args(argv)
 
-    # Markdown output uses a few non-ASCII characters (—, …). Make sure stdout
-    # can render them even on a legacy Windows code page.
+    # The report uses a few non-ASCII chars; make sure stdout can handle them
+    # on a legacy Windows code page.
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
+        if reconfigure:
             try:
                 reconfigure(encoding="utf-8")
             except (ValueError, OSError):
                 pass
 
-    # 1. Collect raw stats from local git history.
     try:
         stats = gitstats.collect(args.repo, branch=args.branch)
     except gitstats.GitError as exc:
@@ -125,84 +66,57 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no commits found in this repository.", file=sys.stderr)
         return 2
 
-    # --- Whole-team mode --------------------------------------------------
     if args.team:
-        return _run_team(stats, args)
+        return run_team(stats, args)
 
-    # 2. Resolve the subject (the person being analyzed).
-    subject = _resolve_subject(stats, args)
+    subject = resolve_subject(stats, args)
     if subject is None:
         return 2
 
-    # 3. Anonymize into an output-safe payload.
     payload = anonymize.build_payload(stats, subject)
-
     if args.dump_payload:
         print(json.dumps(payload, indent=2))
         return 0
 
-    # 4. Optionally ask Claude for the narrative.
-    narrative = None
-    model_used = None
-    if not args.no_ai:
-        try:
-            narrative = claude.generate_report(
-                payload, api_key=args.api_key, model=args.model
-            )
-            model_used = args.model
-        except claude.ClaudeError as exc:
-            print(f"warning: AI narrative skipped: {exc}", file=sys.stderr)
-
-    # 5. Render and emit the report.
-    text = report.render(
-        payload, narrative, repo_path=args.repo, model=model_used
+    narrative, model_used = maybe_narrative(
+        lambda: claude.generate_report(payload, api_key=args.api_key, model=args.model),
+        args,
     )
-    if args.out:
-        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        print(f"Report written to {args.out}", file=sys.stderr)
-    else:
-        print(text)
-    return 0
+    return emit(report.render(payload, narrative, repo_path=args.repo, model=model_used), args)
 
 
-def _run_team(stats, args) -> int:
-    """Whole-codebase mode: profile and rank every contributor."""
+def run_team(stats, args):
     payload = anonymize.build_team_payload(
-        stats,
-        identify=args.identify,
-        top=args.top,
-        min_commits=args.min_commits,
+        stats, identify=args.identify, top=args.top, min_commits=args.min_commits,
     )
-
     if not payload["contributors"]:
-        print(
-            "error: no contributors met --min-commits; lower the threshold.",
-            file=sys.stderr,
-        )
+        print("error: no contributors met --min-commits; lower the threshold.",
+              file=sys.stderr)
         return 2
-
     if args.dump_payload:
         print(json.dumps(payload, indent=2))
         return 0
 
-    narrative = None
-    model_used = None
-    if not args.no_ai:
-        try:
-            narrative = claude.generate_team_report(
-                payload,
-                identify=args.identify,
-                api_key=args.api_key,
-                model=args.model,
-            )
-            model_used = args.model
-        except claude.ClaudeError as exc:
-            print(f"warning: AI narrative skipped: {exc}", file=sys.stderr)
-
-    text = report.render_team(
-        payload, narrative, repo_path=args.repo, model=model_used
+    narrative, model_used = maybe_narrative(
+        lambda: claude.generate_team_report(
+            payload, identify=args.identify, api_key=args.api_key, model=args.model),
+        args,
     )
+    return emit(report.render_team(payload, narrative, repo_path=args.repo, model=model_used), args)
+
+
+def maybe_narrative(call, args):
+    """Run the Claude call unless --no-ai; degrade gracefully on error."""
+    if args.no_ai:
+        return None, None
+    try:
+        return call(), args.model
+    except claude.ClaudeError as exc:
+        print(f"warning: AI narrative skipped: {exc}", file=sys.stderr)
+        return None, None
+
+
+def emit(text, args):
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
@@ -212,17 +126,12 @@ def _run_team(stats, args) -> int:
     return 0
 
 
-def _resolve_subject(stats, args):
+def resolve_subject(stats, args):
     if args.author:
         subject = gitstats.match_author(stats, args.author)
         if subject is None:
-            print(
-                f"error: no contributor matched '{args.author}'. "
-                "Try --author with an email, or run with --dump-payload to "
-                "inspect, or omit --author to use your git config.",
-                file=sys.stderr,
-            )
-            return None
+            print(f"error: no contributor matched '{args.author}'. Try an email, "
+                  "or --dump-payload to inspect.", file=sys.stderr)
         return subject
 
     name, email = gitstats.detect_self(args.repo)
@@ -232,11 +141,8 @@ def _resolve_subject(stats, args):
             if subject is not None:
                 return subject
 
-    print(
-        "error: could not determine which contributor is 'you'. "
-        "Pass --author <name-or-email> explicitly.",
-        file=sys.stderr,
-    )
+    print("error: couldn't tell which contributor is 'you'. Pass --author.",
+          file=sys.stderr)
     return None
 
 
