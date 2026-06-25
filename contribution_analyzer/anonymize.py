@@ -73,6 +73,15 @@ def build_team_payload(stats, *, identify=False, top=None, min_commits=1):
             **c.to_metrics(),
         })
 
+    # Relative rework band, so "low/high rework" is cohort-justified, not asserted.
+    ratios = sorted(c["rework_ratio"] for c in contributors)
+    if ratios:
+        median = ratios[len(ratios) // 2]
+        for c in contributors:
+            r = c["rework_ratio"]
+            c["rework_band"] = ("low" if r < median * 0.8
+                                else "high" if r > median * 1.2 else "mid")
+
     return {
         "mode": "team",
         "identified": bool(identify),

@@ -102,36 +102,44 @@ def render_team(payload, narrative, *, repo_path, model):
 
 def team_table(payload):
     rows = [
-        "| # | Contributor | Commits | Active mo. | Net churn | Tickets | Avg size | Top focus |",
+        "| # | Contributor | Commits | Active mo. | Tickets | Tickets/mo | Rework | Top focus |",
         "| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for c in payload["contributors"]:
         rows.append(
             f"| {c['rank']} | {c['label']} | {c['commits']} | {c['active_months']} "
-            f"| {c['net_churn']} | {c['distinct_tickets_referenced']} "
-            f"| {c['avg_commit_size_lines']} | {top_focus(c)} |"
+            f"| {c['distinct_tickets_referenced']} | {c['tickets_per_active_month']} "
+            f"| {pct1(c['rework_ratio'])} | {top_focus(c)} |"
         )
     return "\n".join(rows)
 
 
 def member_block(c):
+    dup = (f" · {pct(c['duplicate_commit_ratio'])} duplicate subjects"
+           if c.get("duplicate_commit_ratio") else "")
     return "\n".join([
         f"## #{c['rank']} — {c['label']}",
         f"{c['commits']} commits | {c['active_months']} active months | "
-        f"{c['distinct_tickets_referenced']} ticket refs | {c['net_churn']} net churn",
+        f"{c['distinct_tickets_referenced']} tickets shipped",
         "",
         f"- Commit-type mix: {counts(c['commit_categories'])}",
         f"- Topic focus: {counts(c['topic_commits'])}",
         f"- Where they work: {counts(c['path_categories'])}",
-        f"- Cadence: {c['commits_per_active_month']} commits/active-month, "
+        f"- Cadence: {c['feature_commits_per_active_month']} feature commits/mo, "
+        f"{c['net_feature_lines_per_active_month']} net feature lines/mo, "
         f"avg commit {c['avg_commit_size_lines']} lines",
-        f"- Commit-time rhythm (UTC): {hours(c['hour_distribution'])}",
+        f"- Working hours (UTC): {c.get('active_hour_range') or '—'} "
+        f"({hours(c['hour_distribution'])})",
+        f"- Rework: {pct1(c['rework_ratio'])} fix/revert ({c.get('rework_band', 'mid')} for the team){dup}",
+        f"- **KeyMetric:** {c['tickets_per_active_month']} tickets shipped per month "
+        f"with a {pct1(c['rework_ratio'])} rework ratio.",
     ])
 
 
 def top_focus(c):
-    for field in ("topic_commits", "commit_categories"):
-        d = c.get(field) or {}
+    # prefer the exclusive commit-type (skip the catch-all "other"); topics overlap
+    cats = {k: v for k, v in (c.get("commit_categories") or {}).items() if k != "other"}
+    for d in (cats, c.get("topic_commits") or {}):
         if d:
             name, n = next(iter(d.items()))
             return f"{name} ({n})"
@@ -196,3 +204,7 @@ def hours(h):
 
 def pct(value):
     return f"{round(value * 100)}%"
+
+
+def pct1(value):
+    return f"{round(value * 100, 1)}%"

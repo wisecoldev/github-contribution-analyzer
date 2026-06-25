@@ -1,10 +1,14 @@
 """Read per-author contribution stats out of a local git repo.
 
-Everything here is aggregate metadata: commit/line/file counts, cadence, a
-coarse hour-of-day histogram, and — for team mode — locally bucketed commit
-types, topics and path categories. Commit subjects and file paths are looked at
-to build those buckets, but only the resulting counts are kept; the raw text
-and paths never leave this module.
+Everything is aggregate metadata: commit/line/file counts, cadence, a coarse
+hour histogram, and — for team mode — commit-type / topic / path buckets plus a
+few derived rates (rework ratio, tickets and feature commits per month, ...).
+Subjects and paths are inspected to build the buckets, but only counts leave
+this module; raw text and paths never do.
+
+Classification matches whole-word tokens (and a few multi-word phrases), not raw
+substrings — so "author" doesn't read as security, "observer" isn't infra,
+"maintain" isn't AI, "latest" isn't a test, and "prefix" isn't a fix.
 """
 
 from __future__ import annotations
@@ -15,78 +19,78 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-# Separators we inject into the git pretty-format. Picked because they won't
-# show up in author names or commit subjects.
 SEP = "\x1f"
 COMMIT = "\x1e__COMMIT__"
 PRETTY = COMMIT + "%x1f%H%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%s"
 
-# "#1234", "ABC-123" (Jira) or "GH-123". We only ever keep how many distinct
-# ones a person referenced, not the IDs.
+TOKEN = re.compile(r"[a-z0-9]+")
 TICKET = re.compile(r"(?:#\d+|\b[A-Z][A-Z0-9]+-\d+\b)")
-
-# A conventional-commit prefix like "feat:", "fix(api)!:", "ci :".
 PREFIX = re.compile(r"^\s*([a-zA-Z]+)\s*(?:\([^)]*\))?\s*!?\s*:")
 
 PREFIX_TYPES = {
     "feat": "feat", "feature": "feat",
     "fix": "fix", "bugfix": "fix", "hotfix": "fix",
     "docs": "docs", "doc": "docs",
-    "style": "style",
-    "refactor": "refactor",
-    "perf": "perf",
+    "style": "style", "refactor": "refactor", "perf": "perf",
     "test": "test", "tests": "test",
     "build": "build", "deps": "build",
-    "ci": "ci",
-    "chore": "chore",
-    "revert": "revert",
+    "ci": "ci", "chore": "chore", "revert": "revert",
 }
 
-# Used when there's no conventional prefix. Order matters — first hit wins, so
-# "fix the docs" lands in fix, not docs.
-KEYWORD_TYPES = [
-    ("revert", ("revert",)),
-    ("fix", ("fix", "bug", "hotfix", "patch", "resolve", "correct")),
-    ("perf", ("perf", "optimi", "speed up", "faster", "latency")),
-    ("test", ("test", "spec", "coverage")),
-    ("docs", ("readme", "document", "docs", "changelog", "comment")),
-    ("ci", ("ci ", "pipeline", "workflow", "github action", "gitlab")),
-    ("build", ("bump", "upgrade", "dependency", "dependencies", "deps", "build")),
-    ("refactor", ("refactor", "rename", "cleanup", "clean up", "simplify", "tidy")),
-    ("feat", ("add", "implement", "introduce", "support", "create", "new ", "feature")),
+# (tokens, phrases) per bucket. A subject matches if it shares a whole-word
+# token with the set, or contains one of the phrases. Inflections are listed
+# explicitly rather than matched by prefix, to stay precise.
+def _b(tokens, *phrases):
+    return (set(tokens.split()), phrases)
+
+# Commit type — single label, first match in this order wins.
+TYPES = [
+    ("revert", _b("revert reverts reverted reverting")),
+    ("fix", _b("fix fixes fixed fixing bug bugs bugfix hotfix patch patches "
+               "patched resolve resolves resolved correct corrects corrected")),
+    ("perf", _b("perf performance optimize optimise optimized optimised "
+                "optimization optimisation faster latency", "speed up")),
+    ("test", _b("test tests tested testing spec specs coverage")),
+    ("docs", _b("readme docs doc document documentation changelog comment comments")),
+    ("ci", _b("ci pipeline pipelines workflow workflows", "github action")),
+    ("build", _b("build builds rebuild bump bumps bumped upgrade upgrades "
+                 "upgraded dependency dependencies deps")),
+    ("refactor", _b("refactor refactors refactored refactoring rename renames "
+                    "renamed cleanup simplify simplified tidy", "clean up")),
+    ("feat", _b("add adds added adding implement implements implemented "
+                "introduce introduces introduced support supports supported "
+                "create creates created new feature features")),
 ]
 
-# Topics can overlap (one commit may be both "infra" and "ci").
+# Topics — multiple may apply to one commit.
 TOPICS = [
-    ("automation", ("ai", "agent", "claude", "llm", "copilot", "automation",
-                    "pipeline", "codegen", "scaffold")),
-    ("infra", ("infra", "deploy", "docker", "kubernetes", "k8s", "terraform",
-               "ansible", "helm", "nginx", "cron", "server", "hetzner", "aws",
-               "gcp", "azure")),
-    ("ci", ("ci ", "ci/", "pipeline", "workflow", "github action", "gitlab",
-            "jenkins", "build system")),
-    ("security", ("security", "vuln", "cve", "auth", "sanitiz", "csrf", "xss",
-                  "injection", "secret", "credential", "timing-safe", "hash_equals")),
-    ("tech_debt", ("remove", "delete", "deprecat", "drop ", "retire", "kill",
-                   "dead code", "unused", "cleanup", "clean up")),
-    ("planning", ("plan", "rfc", "design doc", "proposal", "investigation",
-                  "incident", "postmortem", "post-mortem", "spike", "adr")),
-    ("typing_quality", ("strict_types", "type hint", "mypy", "psalm", "phpcs",
-                        "typescript", "type-check", "typecheck", "lint")),
+    ("automation", _b("ai agent agents llm llms claude copilot automation "
+                      "automate automated codegen scaffold bot bots")),
+    ("infra", _b("infra infrastructure deploy deployed deployment docker "
+                 "dockerfile kubernetes k8s terraform ansible helm nginx cron "
+                 "crontab server servers serverless aws gcp azure")),
+    ("ci", _b("ci pipeline pipelines workflow workflows jenkins gitlab",
+              "github action")),
+    ("security", _b("security secure vuln vulnerability cve auth authn authz "
+                    "authenticate authentication authorize authorization oauth "
+                    "sanitize sanitized csrf xss injection secret secrets "
+                    "credential credentials")),
+    ("tech_debt", _b("remove removes removed removal delete deletes deleted "
+                     "deprecate deprecated deprecation retire retired kill kills "
+                     "killed drop drops dropped unused obsolete cleanup",
+                     "dead code", "tech debt", "technical debt")),
+    ("planning", _b("plan plans planning planned rfc proposal proposals "
+                    "investigation incident incidents postmortem spike adr adrs",
+                    "design doc", "post-mortem", "implementation plan")),
+    ("typing_quality", _b("mypy psalm phpcs phpstan lint linter linting eslint "
+                          "tslint ruff typescript typecheck",
+                          "strict_types", "type hint", "type check",
+                          "static analysis")),
 ]
 
-# First matching rule wins for a given file path.
-PATH_RULES = [
-    ("ci", (".github/workflows", ".gitlab-ci", "azure-pipelines", "jenkinsfile",
-            ".circleci", "/ci/", "ci/")),
-    ("infra", ("dockerfile", "docker-compose", "/k8s/", "kubernetes", ".tf",
-               "terraform", "ansible", "helm", "/deploy", "/infra", "/charts/")),
-    ("docs", ("/docs/", "docs/", "readme", ".md", ".rst", ".adoc", "/doc/")),
-    ("tests", ("/test", "tests/", "/spec", "__tests__", ".test.", ".spec.",
-               "_test.", "test_")),
-    ("config", (".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
-                ".lock", "config/")),
-]
+# paths that shouldn't count toward authored feature churn
+GENERATED = ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "/dist/",
+             "/vendor/", "node_modules/", ".min.")
 
 
 class GitError(RuntimeError):
@@ -95,8 +99,6 @@ class GitError(RuntimeError):
 
 @dataclass
 class ContributorStats:
-    # name/email are kept locally for self-detection and --identify; the
-    # anonymized payload drops them.
     key: str
     name: str
     email: str
@@ -116,11 +118,18 @@ class ContributorStats:
     extensions: Counter = field(default_factory=Counter)
     hour_histogram: Counter = field(default_factory=Counter)
     subject_lengths: list = field(default_factory=list)
+    subject_counts: Counter = field(default_factory=Counter)  # for duplicate detection
 
     categories: Counter = field(default_factory=Counter)
     topics: Counter = field(default_factory=Counter)
     path_categories: Counter = field(default_factory=Counter)
     ticket_refs: set = field(default_factory=set)
+    ci_infra_commits: int = 0
+
+    md_files: set = field(default_factory=set)
+    feat_insertions: int = 0
+    feat_deletions: int = 0
+    _cur_is_feat: bool = False
 
     def record_commit(self, ts, subject, is_merge=False):
         self.commits += 1
@@ -136,24 +145,39 @@ class ContributorStats:
         self.active_months.add(dt.strftime("%Y-%m"))
         self.hour_histogram[dt.hour] += 1
         self.subject_lengths.append(len(subject))
+        self.subject_counts[subject.strip().lower()] += 1
 
-        self.categories[classify_subject(subject)] += 1
-        for topic in classify_topics(subject):
-            self.topics[topic] += 1
+        cat = classify_subject(subject)
+        self.categories[cat] += 1
+        self._cur_is_feat = cat == "feat"
+
+        topics = classify_topics(subject)
+        for t in topics:
+            self.topics[t] += 1
+        if {"infra", "ci"} & set(topics):
+            self.ci_infra_commits += 1
+
         self.ticket_refs.update(TICKET.findall(subject))
 
     def record_file(self, added, deleted, path):
         self.files_touched.add(path)
-        self.extensions[extension(path)] += 1
+        ext = extension(path)
+        self.extensions[ext] += 1
         self.path_categories[classify_path(path)] += 1
+        if ext in (".md", ".mdx"):
+            self.md_files.add(path)
         if added == "-" or deleted == "-":
             self.binary_edits += 1
             return
         try:
-            self.insertions += int(added)
-            self.deletions += int(deleted)
+            ins, dele = int(added), int(deleted)
         except ValueError:
-            pass
+            return
+        self.insertions += ins
+        self.deletions += dele
+        if self._cur_is_feat and not is_generated(path):
+            self.feat_insertions += ins
+            self.feat_deletions += dele
 
     def to_metrics(self) -> dict:
         span_days = 0
@@ -161,11 +185,12 @@ class ContributorStats:
             span_days = max(1, round((self.last_commit_ts - self.first_commit_ts) / 86400))
 
         churn = self.insertions + self.deletions
-        months = len(self.active_months) or 0
-        if self.subject_lengths:
-            avg_subject = round(sum(self.subject_lengths) / len(self.subject_lengths), 1)
-        else:
-            avg_subject = 0
+        months = len(self.active_months)
+        per_month = (lambda n: round(n / months, 1)) if months else (lambda n: 0)
+        rework = self.categories.get("fix", 0) + self.categories.get("revert", 0)
+        dups = sum(n - 1 for n in self.subject_counts.values() if n > 1)
+        avg_subject = (round(sum(self.subject_lengths) / len(self.subject_lengths), 1)
+                       if self.subject_lengths else 0)
 
         return {
             "commits": self.commits,
@@ -178,26 +203,35 @@ class ContributorStats:
             "active_days": len(self.active_days),
             "active_months": months,
             "span_days": span_days,
-            "commits_per_active_month": round(self.commits / months, 1) if months else 0,
-            "net_lines_per_active_month": (
-                round((self.insertions - self.deletions) / months, 1) if months else 0
+            "commits_per_active_month": per_month(self.commits),
+            "net_lines_per_active_month": per_month(self.insertions - self.deletions),
+            "feature_commits_per_active_month": per_month(self.categories.get("feat", 0)),
+            "net_feature_lines_per_active_month": (
+                round((self.feat_insertions - self.feat_deletions) / months) if months else 0
             ),
             "avg_commit_size_lines": round(churn / self.commits, 1) if self.commits else 0,
             "avg_subject_length_chars": avg_subject,
             "short_subject_ratio": short_subject_ratio(self.subject_lengths),
+            "rework_ratio": round(rework / self.commits, 3) if self.commits else 0.0,
+            "duplicate_commit_ratio": round(dups / self.commits, 3) if self.commits else 0.0,
+            "max_subject_repeats": max(self.subject_counts.values(), default=0),
             "distinct_tickets_referenced": len(self.ticket_refs),
+            "tickets_per_active_month": per_month(len(self.ticket_refs)),
+            "doc_commit_share": round(self.categories.get("docs", 0) / self.commits, 3) if self.commits else 0.0,
+            "markdown_files_touched": len(self.md_files),
+            "ci_infra_commits": self.ci_infra_commits,
             "commit_categories": dict(self.categories.most_common()),
             "topic_commits": dict(self.topics.most_common()),
             "path_categories": dict(self.path_categories.most_common()),
             "top_extensions": dict(self.extensions.most_common(8)),
             "hour_distribution": bucket_hours(self.hour_histogram),
+            "active_hour_range": hour_range(self.hour_histogram),
             "first_commit": iso_day(self.first_commit_ts),
             "last_commit": iso_day(self.last_commit_ts),
         }
 
 
 def collect(repo_path, branch=None) -> dict[str, ContributorStats]:
-    """Aggregate per-author stats from `git log --numstat`."""
     args = ["git", "-C", repo_path, "log", "--no-color", "--numstat",
             "--pretty=format:" + PRETTY]
     if branch:
@@ -241,7 +275,6 @@ def collect(repo_path, branch=None) -> dict[str, ContributorStats]:
 
 
 def detect_self(repo_path):
-    """(name, email) from git config, or (None, None)."""
     def cfg(key):
         try:
             out = subprocess.run(["git", "-C", repo_path, "config", "--get", key],
@@ -266,7 +299,6 @@ def match_author(stats, query):
     if len(matches) == 1:
         return matches[0]
     if matches:
-        # ambiguous fragment — go with whoever committed most
         return max(matches, key=lambda c: c.commits)
     return None
 
@@ -278,29 +310,55 @@ def classify_subject(subject):
         if kind:
             return kind
     low = subject.lower()
-    for bucket, needles in KEYWORD_TYPES:
-        if any(n in low for n in needles):
+    tokens = set(TOKEN.findall(low))
+    for bucket, spec in TYPES:
+        if matches(tokens, low, spec):
             return bucket
     return "other"
 
 
 def classify_topics(subject):
     low = subject.lower()
-    return [name for name, needles in TOPICS if any(n in low for n in needles)]
+    tokens = set(TOKEN.findall(low))
+    return [name for name, spec in TOPICS if matches(tokens, low, spec)]
+
+
+def matches(tokens, low, spec):
+    words, phrases = spec
+    return bool(words & tokens) or any(p in low for p in phrases)
 
 
 def classify_path(path):
     low = path.lower()
-    for bucket, needles in PATH_RULES:
-        if any(n in low for n in needles):
-            return bucket
+    ext = extension(low)
+    base = low.rsplit("/", 1)[-1]
+    segs = set(low.split("/"))
+    if (".github/workflows" in low or ".gitlab-ci" in low or "azure-pipelines" in low
+            or base == "jenkinsfile" or ".circleci" in segs):
+        return "ci"
+    if (ext == ".tf" or base in ("dockerfile", "docker-compose.yml")
+            or segs & {"k8s", "terraform", "ansible", "helm", "deploy", "infra", "charts"}):
+        return "infra"
+    if ext in (".md", ".mdx", ".rst", ".adoc") or base.startswith("readme") or segs & {"docs", "doc"}:
+        return "docs"
+    if (segs & {"test", "tests", "spec", "specs", "__tests__"}
+            or ".test." in base or ".spec." in base
+            or base.startswith("test_") or base.endswith("_test.go")):
+        return "tests"
+    if (ext in (".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env", ".lock")
+            or "config" in segs):
+        return "config"
     return "src"
+
+
+def is_generated(path):
+    return any(g in path.lower() for g in GENERATED)
 
 
 def extension(path):
     base = path.rsplit("/", 1)[-1]
     if base.startswith(".") and base.count(".") == 1:
-        return base  # dotfile, e.g. .gitignore
+        return base
     if "." in base:
         return "." + base.rsplit(".", 1)[-1].lower()
     return "(none)"
@@ -308,17 +366,21 @@ def extension(path):
 
 def bucket_hours(counter):
     total = sum(counter.values()) or 1
-    buckets = {"00-06": 0, "06-12": 0, "12-18": 0, "18-24": 0}
+    out = {"00-06": 0, "06-12": 0, "12-18": 0, "18-24": 0}
     for hour, n in counter.items():
-        if hour < 6:
-            buckets["00-06"] += n
-        elif hour < 12:
-            buckets["06-12"] += n
-        elif hour < 18:
-            buckets["12-18"] += n
-        else:
-            buckets["18-24"] += n
-    return {k: round(v / total, 3) for k, v in buckets.items()}
+        out["%02d-%02d" % (hour // 6 * 6, hour // 6 * 6 + 6)] += n
+    return {k: round(v / total, 3) for k, v in out.items()}
+
+
+def hour_range(counter):
+    """Tightest UTC hour window, ignoring hours with <1% of commits."""
+    total = sum(counter.values())
+    if not total:
+        return None
+    hours = sorted(h for h, n in counter.items() if n / total >= 0.01)
+    if not hours:
+        hours = sorted(counter)
+    return "%02d:00-%02d:00" % (hours[0], hours[-1])
 
 
 def short_subject_ratio(lengths, threshold=15):
