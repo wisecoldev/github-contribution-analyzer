@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Generated reports
+*.report.md
+report.md
+out/
+
+# Secrets — never commit your API key
+.env
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
